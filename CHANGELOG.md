@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.1
+
+- Prevent cancelled downloads from holding a queue slot indefinitely.
+- Escalate cancellation when a downloader process does not exit cleanly.
+- Preserve ordered progress output and useful final error messages.
+- Prevent URL analysis from hanging on full output pipes.
+- Cancel stale URL analyses and ignore results for superseded links.
+- Harden backend argument handling and packaged app metadata.
+
 ## 1.0.0
 
 - Initial FetchDeck release.
