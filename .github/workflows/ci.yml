@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: swift test --package-path mac-app
+      - name: Check formatting
+        run: |
+          xcrun swift-format lint --strict --recursive \
+            mac-app/Sources \
+            mac-app/Tests \
+            mac-app/Package.swift \
+            mac-app/generate-icon.swift
+      - name: Validate property lists and scripts
+        run: |
+          plutil -lint \
+            mac-app/Info.plist \
+            mac-app/App.entitlements.plist \
+            mac-app/Node.entitlements.plist \
+            mac-app/YTDLP.entitlements.plist
+          sh -n \
+            mac-app/build-app.sh \
+            mac-app/build-ffmpeg-runtime.sh \
+            mac-app/fetch-distribution-dependencies.sh \
+            mac-app/release-app.sh

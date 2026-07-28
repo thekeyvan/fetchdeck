@@ -1,0 +1,10 @@
+.DS_Store
+.build-tools/
+dist/
+downloads/
+mac-app/.build/
+mac-app/.swiftpm/
+*.part
+*.ytdl
+*.cookies
+cookies.txt
