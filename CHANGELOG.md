@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.2
+
+- Save new downloads under `~/Downloads/FetchDeck Downloads` by default.
+- Reorganize Settings into focused Downloads, Queue, Media, Access, and
+  Advanced categories.
+- Show only the quality or audio controls relevant to the selected mode.
+- Keep existing custom download destinations unchanged.
+
 ## 1.0.1
 
 - Prevent cancelled downloads from holding a queue slot indefinitely.
