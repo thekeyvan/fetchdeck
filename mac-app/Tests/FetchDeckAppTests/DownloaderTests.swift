@@ -41,6 +41,7 @@ final class DownloaderTests: XCTestCase {
       "4"
     )
     XCTAssertEqual(arguments[arguments.firstIndex(of: "--retries")! + 1], "10")
+    XCTAssertEqual(arguments[arguments.count - 2], "--")
     XCTAssertEqual(arguments.last, "https://www.youtube.com/playlist?list=test")
   }
 
@@ -91,6 +92,10 @@ final class DownloaderTests: XCTestCase {
       previewArguments[previewArguments.firstIndex(of: "--cookies-from-browser")! + 1],
       "chrome"
     )
+    XCTAssertEqual(downloadArguments[downloadArguments.count - 2], "--")
+    XCTAssertEqual(downloadArguments.last, "https://youtu.be/member-video")
+    XCTAssertEqual(previewArguments[previewArguments.count - 2], "--")
+    XCTAssertEqual(previewArguments.last, "https://youtu.be/member-video")
   }
 
   func testCookiesFilePathIsPassedWithoutCookieContents() {

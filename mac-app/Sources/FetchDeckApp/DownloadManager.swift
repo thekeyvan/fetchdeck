@@ -14,6 +14,12 @@ enum DownloadConcurrencyPolicy {
 
 @MainActor
 final class DownloadManager: ObservableObject {
+  private enum TransferEvent {
+    case output(String)
+    case endOfFile
+    case terminated(Int32)
+  }
+
   @Published private(set) var jobs: [DownloadJob] = []
   @Published private(set) var queuePaused = false
   @Published var maxConcurrentDownloads: Int {
@@ -34,11 +40,21 @@ final class DownloadManager: ObservableObject {
     var itemCount: Int
     var cancelRequested = false
     var lastError: String?
+    var didReachEOF = false
+    var terminationStatus: Int32?
+    let eventContinuation: AsyncStream<TransferEvent>.Continuation
+    var eventTask: Task<Void, Never>?
 
-    init(process: Process, pipe: Pipe, itemCount: Int) {
+    init(
+      process: Process,
+      pipe: Pipe,
+      itemCount: Int,
+      eventContinuation: AsyncStream<TransferEvent>.Continuation
+    ) {
       self.process = process
       self.pipe = pipe
       self.itemCount = itemCount
+      self.eventContinuation = eventContinuation
     }
   }
 
@@ -241,19 +257,39 @@ final class DownloadManager: ObservableObject {
     process.standardError = pipe
     process.environment = processEnvironment()
 
-    pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-      let data = handle.availableData
-      guard !data.isEmpty else { return }
-      let chunk = String(decoding: data, as: UTF8.self)
-      Task { @MainActor in
-        self?.consume(chunk, for: job.id)
+    var continuation: AsyncStream<TransferEvent>.Continuation?
+    let events = AsyncStream<TransferEvent> {
+      continuation = $0
+    }
+    guard let continuation else {
+      failBeforeStart(index, message: "Could not prepare the download stream")
+      return
+    }
+
+    let transfer = ActiveTransfer(
+      process: process,
+      pipe: pipe,
+      itemCount: max(job.preview.itemCount, 1),
+      eventContinuation: continuation
+    )
+    transfer.eventTask = Task { @MainActor [weak self] in
+      for await event in events {
+        self?.receive(event, for: job.id)
       }
     }
-    process.terminationHandler = { [weak self] finished in
-      let exitCode = finished.terminationStatus
-      Task { @MainActor in
-        self?.finish(job.id, exitCode: exitCode)
+
+    pipe.fileHandleForReading.readabilityHandler = { handle in
+      let data = handle.availableData
+      guard !data.isEmpty else {
+        handle.readabilityHandler = nil
+        continuation.yield(.endOfFile)
+        return
       }
+      let chunk = String(decoding: data, as: UTF8.self)
+      continuation.yield(.output(chunk))
+    }
+    process.terminationHandler = { finished in
+      continuation.yield(.terminated(finished.terminationStatus))
     }
 
     jobs[index].state = .downloading
@@ -262,17 +298,15 @@ final class DownloadManager: ObservableObject {
     jobs[index].log = ""
     jobs[index].speedText = nil
     jobs[index].etaText = nil
-    transfers[job.id] = ActiveTransfer(
-      process: process,
-      pipe: pipe,
-      itemCount: max(job.preview.itemCount, 1)
-    )
+    transfers[job.id] = transfer
     save()
 
     do {
       try process.run()
     } catch {
       pipe.fileHandleForReading.readabilityHandler = nil
+      continuation.finish()
+      transfer.eventTask?.cancel()
       transfers.removeValue(forKey: job.id)
       failBeforeStart(index, message: error.localizedDescription)
     }
@@ -300,18 +334,16 @@ final class DownloadManager: ObservableObject {
       let index = jobs.firstIndex(where: { $0.id == id })
     else { return }
 
-    if let values = captures(#"Downloading item (\d+) of (\d+)"#, in: line),
-      values.count == 2
-    {
-      transfer.currentItem = Int(values[0]) ?? 0
-      transfer.itemCount = Int(values[1]) ?? transfer.itemCount
+    let update = ProgressParser.parse(line)
+
+    if let itemIndex = update.itemIndex, let itemCount = update.itemCount {
+      transfer.currentItem = itemIndex
+      transfer.itemCount = itemCount
       jobs[index].statusText =
         "Item \(transfer.currentItem) of \(transfer.itemCount)"
     }
 
-    if let values = captures(#"\[download\]\s+(\d+(?:\.\d+)?)%"#, in: line),
-      let fileProgress = Double(values[0])
-    {
+    if let fileProgress = update.filePercent {
       if transfer.currentItem > 0, transfer.itemCount > 0 {
         jobs[index].progress =
           (Double(transfer.currentItem - 1) + fileProgress / 100)
@@ -320,36 +352,60 @@ final class DownloadManager: ObservableObject {
         jobs[index].progress = fileProgress
       }
     }
-    if let speed = captures(#"\bat\s+(\S+/s)"#, in: line)?.first {
+    if let speed = update.speed {
       jobs[index].speedText = speed
     }
-    if let eta = captures(#"\bETA\s+(\S+)"#, in: line)?.first {
+    if let eta = update.eta {
       jobs[index].etaText = eta
     }
-    if let size = captures(#"\bof\s+~?\s*(\S+)"#, in: line)?.first {
+    if let size = update.size {
       jobs[index].sizeText = size
     }
 
-    if line.contains("[Merger]") {
+    switch update.phase {
+    case .merging:
       jobs[index].state = .processing
       jobs[index].statusText = "Merging video and audio…"
-    } else if line.contains("[ExtractAudio]") {
+    case .extractingAudio:
       jobs[index].state = .processing
       jobs[index].statusText =
         "Creating \(jobs[index].options.audioFormat.rawValue.uppercased())…"
-    } else if line.contains("[Metadata]") || line.contains("[EmbedThumbnail]") {
+    case .addingMetadata, .embeddingThumbnail:
       jobs[index].state = .processing
       jobs[index].statusText = "Adding finishing touches…"
-    } else if line.contains("has already been recorded in the archive") {
+    case .skippingArchived:
       jobs[index].statusText = "Already downloaded — skipping…"
-    } else if line.hasPrefix("__YTDLP_FILE__:") {
+    case .saved:
       jobs[index].statusText = "Saved successfully"
-    } else if line.contains("ERROR:") {
-      transfer.lastError =
-        line.components(separatedBy: "ERROR:").last?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
+    case nil:
+      break
+    }
+    if let error = update.error {
+      transfer.lastError = error
     }
     appendLog(line + "\n", to: index)
+  }
+
+  private func receive(_ event: TransferEvent, for id: UUID) {
+    guard let transfer = transfers[id] else { return }
+    switch event {
+    case .output(let chunk):
+      consume(chunk, for: id)
+    case .endOfFile:
+      transfer.didReachEOF = true
+      completeIfFinished(id)
+    case .terminated(let status):
+      transfer.terminationStatus = status
+      completeIfFinished(id)
+    }
+  }
+
+  private func completeIfFinished(_ id: UUID) {
+    guard let transfer = transfers[id],
+      transfer.didReachEOF,
+      let exitCode = transfer.terminationStatus
+    else { return }
+    finish(id, exitCode: exitCode)
   }
 
   private func finish(_ id: UUID, exitCode: Int32) {
@@ -362,6 +418,7 @@ final class DownloadManager: ObservableObject {
       transfer.parseBuffer = ""
     }
     transfer.pipe.fileHandleForReading.readabilityHandler = nil
+    transfer.eventContinuation.finish()
     transfers.removeValue(forKey: id)
 
     if transfer.cancelRequested {
@@ -390,18 +447,6 @@ final class DownloadManager: ObservableObject {
     jobs[index].log += text
     if jobs[index].log.count > 30_000 {
       jobs[index].log.removeFirst(jobs[index].log.count - 30_000)
-    }
-  }
-
-  private func captures(_ pattern: String, in text: String) -> [String]? {
-    guard let expression = try? NSRegularExpression(pattern: pattern),
-      let match = expression.firstMatch(
-        in: text,
-        range: NSRange(text.startIndex..., in: text)
-      )
-    else { return nil }
-    return (1..<match.numberOfRanges).compactMap {
-      Range(match.range(at: $0), in: text).map { String(text[$0]) }
     }
   }
 

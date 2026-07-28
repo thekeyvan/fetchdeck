@@ -8,12 +8,14 @@ enum BackendLocator {
         return bundled
       }
     }
-    if let override = ProcessInfo.processInfo.environment["YT_DLP_BINARY"] {
-      let url = URL(fileURLWithPath: override)
-      if FileManager.default.isExecutableFile(atPath: url.path) {
-        return url
+    #if DEBUG
+      if let override = ProcessInfo.processInfo.environment["YT_DLP_BINARY"] {
+        let url = URL(fileURLWithPath: override)
+        if FileManager.default.isExecutableFile(atPath: url.path) {
+          return url
+        }
       }
-    }
+    #endif
     return nil
   }
 
@@ -140,7 +142,7 @@ enum DownloaderCommandBuilder {
     if let nodePath {
       arguments += ["--js-runtimes", "node:\(nodePath)"]
     }
-    arguments.append(url)
+    arguments += ["--", url]
     return arguments
   }
 }
@@ -239,7 +241,7 @@ enum URLInspector {
     if let nodePath {
       arguments += ["--js-runtimes", "node:\(nodePath)"]
     }
-    arguments.append(url)
+    arguments += ["--", url]
     return arguments
   }
 
