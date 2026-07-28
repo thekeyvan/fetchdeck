@@ -12,6 +12,8 @@ struct HomeView: View {
   @State private var isInspecting = false
   @State private var errorMessage: String?
   @State private var authenticationError = false
+  @State private var inspectionID: UUID?
+  @State private var inspectTask: Task<Void, Never>?
   @FocusState private var isURLFocused: Bool
 
   var body: some View {
@@ -33,6 +35,7 @@ struct HomeView: View {
       .frame(maxWidth: .infinity)
     }
     .onAppear { isURLFocused = true }
+    .onDisappear { cancelInspection() }
     .alert(
       authenticationError ? "Account access required" : "Couldn’t analyze this URL",
       isPresented: Binding(
@@ -334,21 +337,46 @@ struct HomeView: View {
 
   private func analyze() {
     guard let url = normalizedURL else { return }
+    cancelInspection()
+    let requestID = UUID()
+    let authentication = settings.authentication
+    inspectionID = requestID
     isInspecting = true
     preview = nil
-    Task {
+    errorMessage = nil
+    authenticationError = false
+    inspectTask = Task { @MainActor in
+      defer {
+        if inspectionID == requestID {
+          inspectionID = nil
+          inspectTask = nil
+          isInspecting = false
+        }
+      }
       do {
-        preview = try await URLInspector.inspect(
+        let inspectedPreview = try await URLInspector.inspect(
           url,
-          authentication: settings.authentication
+          authentication: authentication
         )
+        try Task.checkCancellation()
+        guard inspectionID == requestID, normalizedURL == url else { return }
+        preview = inspectedPreview
+      } catch is CancellationError {
+        return
       } catch {
+        guard inspectionID == requestID, normalizedURL == url else { return }
         authenticationError =
           (error as? PreviewError)?.requiresAuthentication == true
         errorMessage = error.localizedDescription
       }
-      isInspecting = false
     }
+  }
+
+  private func cancelInspection() {
+    inspectionID = nil
+    inspectTask?.cancel()
+    inspectTask = nil
+    isInspecting = false
   }
 
   private func enqueue() {

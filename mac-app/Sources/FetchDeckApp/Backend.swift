@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 enum BackendLocator {
@@ -45,6 +46,16 @@ enum BackendLocator {
       "/usr/local/bin/node",
       "/usr/bin/node",
     ])
+  }
+
+  static func processEnvironment() -> [String: String] {
+    var environment = ProcessInfo.processInfo.environment
+    environment["PATH"] = [
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      environment["PATH"] ?? "/usr/bin:/bin",
+    ].joined(separator: ":")
+    return environment
   }
 
   private static func executablePath(_ candidates: [String]) -> String? {
@@ -172,56 +183,235 @@ enum PreviewError: LocalizedError {
   }
 }
 
+private struct InspectionResult {
+  let terminationStatus: Int32
+  let output: Data
+  let errors: Data
+}
+
+// Mutable capture state is confined to stateQueue.
+private final class InspectionSession: @unchecked Sendable {
+  private let process = Process()
+  private let output = Pipe()
+  private let errors = Pipe()
+  private let stateQueue = DispatchQueue(
+    label: "com.ksapps.fetchdeck.url-inspection"
+  )
+
+  private var outputData = Data()
+  private var errorData = Data()
+  private var outputReachedEOF = false
+  private var errorsReachedEOF = false
+  private var terminationStatus: Int32?
+  private var continuation: CheckedContinuation<InspectionResult, Error>?
+  private var timeoutWorkItem: DispatchWorkItem?
+  private var cancellationRequested = false
+  private var finished = false
+
+  init(
+    executableURL: URL,
+    arguments: [String],
+    environment: [String: String]
+  ) {
+    process.executableURL = executableURL
+    process.arguments = arguments
+    process.standardOutput = output
+    process.standardError = errors
+    process.environment = environment
+  }
+
+  func run(timeout: TimeInterval) async throws -> InspectionResult {
+    try await withTaskCancellationHandler {
+      try Task.checkCancellation()
+      return try await withCheckedThrowingContinuation { continuation in
+        stateQueue.async { [self] in
+          start(continuation: continuation, timeout: timeout)
+        }
+      }
+    } onCancel: {
+      cancel()
+    }
+  }
+
+  private func start(
+    continuation: CheckedContinuation<InspectionResult, Error>,
+    timeout: TimeInterval
+  ) {
+    guard !cancellationRequested else {
+      continuation.resume(throwing: CancellationError())
+      return
+    }
+
+    self.continuation = continuation
+    installHandlers()
+
+    do {
+      try process.run()
+    } catch {
+      complete(with: .failure(error))
+      return
+    }
+
+    let timeoutWorkItem = DispatchWorkItem { [weak self] in
+      self?.timeOut()
+    }
+    self.timeoutWorkItem = timeoutWorkItem
+    stateQueue.asyncAfter(
+      deadline: .now() + timeout,
+      execute: timeoutWorkItem
+    )
+  }
+
+  private func installHandlers() {
+    output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+      let data = handle.availableData
+      if data.isEmpty {
+        handle.readabilityHandler = nil
+      }
+      self?.stateQueue.async {
+        self?.receiveOutput(data)
+      }
+    }
+    errors.fileHandleForReading.readabilityHandler = { [weak self] handle in
+      let data = handle.availableData
+      if data.isEmpty {
+        handle.readabilityHandler = nil
+      }
+      self?.stateQueue.async {
+        self?.receiveErrors(data)
+      }
+    }
+    process.terminationHandler = { [weak self] process in
+      self?.stateQueue.async {
+        self?.receiveTermination(process.terminationStatus)
+      }
+    }
+  }
+
+  private func receiveOutput(_ data: Data) {
+    guard !finished else { return }
+    if data.isEmpty {
+      outputReachedEOF = true
+    } else {
+      outputData.append(data)
+    }
+    completeIfReady()
+  }
+
+  private func receiveErrors(_ data: Data) {
+    guard !finished else { return }
+    if data.isEmpty {
+      errorsReachedEOF = true
+    } else {
+      errorData.append(data)
+    }
+    completeIfReady()
+  }
+
+  private func receiveTermination(_ status: Int32) {
+    guard !finished else { return }
+    terminationStatus = status
+    completeIfReady()
+  }
+
+  private func completeIfReady() {
+    guard outputReachedEOF,
+      errorsReachedEOF,
+      let terminationStatus
+    else { return }
+    complete(
+      with: .success(
+        InspectionResult(
+          terminationStatus: terminationStatus,
+          output: outputData,
+          errors: errorData
+        )
+      )
+    )
+  }
+
+  private func timeOut() {
+    guard !finished else { return }
+    stopProcess()
+    complete(
+      with: .failure(
+        PreviewError.inspectionFailed(
+          "Analysis timed out. Check your connection and try again."
+        )
+      )
+    )
+  }
+
+  private func cancel() {
+    stateQueue.async { [self] in
+      cancellationRequested = true
+      guard continuation != nil, !finished else { return }
+      stopProcess()
+      complete(with: .failure(CancellationError()))
+    }
+  }
+
+  private func stopProcess() {
+    output.fileHandleForReading.readabilityHandler = nil
+    errors.fileHandleForReading.readabilityHandler = nil
+    try? output.fileHandleForReading.close()
+    try? errors.fileHandleForReading.close()
+
+    guard process.isRunning else { return }
+    let processID = process.processIdentifier
+    process.terminate()
+    stateQueue.asyncAfter(deadline: .now() + 1) { [self] in
+      if process.isRunning {
+        _ = Darwin.kill(processID, SIGKILL)
+      }
+    }
+  }
+
+  private func complete(
+    with result: Result<InspectionResult, Error>
+  ) {
+    guard !finished, let continuation else { return }
+    finished = true
+    self.continuation = nil
+    timeoutWorkItem?.cancel()
+    timeoutWorkItem = nil
+    output.fileHandleForReading.readabilityHandler = nil
+    errors.fileHandleForReading.readabilityHandler = nil
+    process.terminationHandler = nil
+    continuation.resume(with: result)
+  }
+}
+
 enum URLInspector {
   static func inspect(
     _ url: String,
-    authentication: AuthenticationOptions? = nil
+    authentication: AuthenticationOptions? = nil,
+    timeout: TimeInterval = 45
   ) async throws -> MediaPreview {
     guard let backend = BackendLocator.ytDLP else {
       throw PreviewError.missingBackend
     }
 
-    return try await withCheckedThrowingContinuation { continuation in
-      let process = Process()
-      let output = Pipe()
-      let errors = Pipe()
-      process.executableURL = backend
-      process.arguments = arguments(
+    let session = InspectionSession(
+      executableURL: backend,
+      arguments: arguments(
         url: url,
         authentication: authentication,
         nodePath: BackendLocator.nodePath
-      )
-      process.standardOutput = output
-      process.standardError = errors
-      process.environment = processEnvironment()
+      ),
+      environment: BackendLocator.processEnvironment()
+    )
+    let result = try await session.run(timeout: timeout)
+    try Task.checkCancellation()
+    let errorText = String(decoding: result.errors, as: UTF8.self)
 
-      process.terminationHandler = { finished in
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-        let errorText = String(decoding: errorData, as: UTF8.self)
-
-        guard finished.terminationStatus == 0 else {
-          let message = cleanError(errorText)
-          let error: PreviewError =
-            requiresAuthentication(message)
-            ? .authenticationRequired(message)
-            : .inspectionFailed(message)
-          continuation.resume(throwing: error)
-          return
-        }
-        do {
-          continuation.resume(returning: try parse(data))
-        } catch {
-          continuation.resume(throwing: error)
-        }
-      }
-
-      do {
-        try process.run()
-      } catch {
-        continuation.resume(throwing: error)
-      }
+    guard result.terminationStatus == 0 else {
+      let message = cleanError(errorText)
+      throw requiresAuthentication(message)
+        ? PreviewError.authenticationRequired(message)
+        : PreviewError.inspectionFailed(message)
     }
+    return try parse(result.output)
   }
 
   static func arguments(
@@ -288,16 +478,6 @@ enum URLInspector {
       return domain
     }
     return nil
-  }
-
-  private static func processEnvironment() -> [String: String] {
-    var environment = ProcessInfo.processInfo.environment
-    environment["PATH"] = [
-      "/opt/homebrew/bin",
-      "/usr/local/bin",
-      environment["PATH"] ?? "/usr/bin:/bin",
-    ].joined(separator: ":")
-    return environment
   }
 
   private static func cleanError(_ text: String) -> String {

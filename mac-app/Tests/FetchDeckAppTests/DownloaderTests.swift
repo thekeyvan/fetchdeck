@@ -160,6 +160,39 @@ final class DownloaderTests: XCTestCase {
     )
   }
 
+  func testTransferCompletionWaitsForEOFOrGracePeriod() {
+    XCTAssertNil(
+      TransferCompletionPolicy.exitCode(
+        didReachEOF: false,
+        terminationStatus: nil,
+        gracePeriodExpired: true
+      )
+    )
+    XCTAssertNil(
+      TransferCompletionPolicy.exitCode(
+        didReachEOF: false,
+        terminationStatus: 130,
+        gracePeriodExpired: false
+      )
+    )
+    XCTAssertEqual(
+      TransferCompletionPolicy.exitCode(
+        didReachEOF: true,
+        terminationStatus: 0,
+        gracePeriodExpired: false
+      ),
+      0
+    )
+    XCTAssertEqual(
+      TransferCompletionPolicy.exitCode(
+        didReachEOF: false,
+        terminationStatus: 130,
+        gracePeriodExpired: true
+      ),
+      130
+    )
+  }
+
   func testOldDownloadOptionsDecodeWithoutAuthentication() throws {
     let data = Data(
       """

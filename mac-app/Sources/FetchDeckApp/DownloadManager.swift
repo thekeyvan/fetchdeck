@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 
 enum DownloadConcurrencyPolicy {
@@ -9,6 +10,19 @@ enum DownloadConcurrencyPolicy {
   ) -> Int {
     guard !queuePaused else { return 0 }
     return max(maximum - activeCount, 0)
+  }
+}
+
+enum TransferCompletionPolicy {
+  static func exitCode(
+    didReachEOF: Bool,
+    terminationStatus: Int32?,
+    gracePeriodExpired: Bool
+  ) -> Int32? {
+    guard let terminationStatus,
+      didReachEOF || gracePeriodExpired
+    else { return nil }
+    return terminationStatus
   }
 }
 
@@ -44,6 +58,8 @@ final class DownloadManager: ObservableObject {
     var terminationStatus: Int32?
     let eventContinuation: AsyncStream<TransferEvent>.Continuation
     var eventTask: Task<Void, Never>?
+    var completionGraceTask: Task<Void, Never>?
+    var cancellationEscalationTask: Task<Void, Never>?
 
     init(
       process: Process,
@@ -121,16 +137,19 @@ final class DownloadManager: ObservableObject {
 
   func cancel(_ id: UUID) {
     guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
-    if let transfer = transfers[id], transfer.process.isRunning {
+    if let transfer = transfers[id] {
       transfer.cancelRequested = true
-      jobs[index].statusText = "Cancelling safely…"
-      transfer.process.interrupt()
-    } else if jobs[index].state == .queued {
-      jobs[index].state = .cancelled
-      jobs[index].statusText = "Cancelled"
-      jobs[index].completedAt = Date()
-      save()
-      startEligibleJobs()
+      if transfer.process.isRunning {
+        jobs[index].statusText = "Cancelling safely…"
+        transfer.process.interrupt()
+        scheduleCancellationEscalation(for: id)
+      } else {
+        transfer.terminationStatus =
+          transfer.terminationStatus ?? transfer.process.terminationStatus
+        completeIfFinished(id, gracePeriodExpired: true)
+      }
+    } else if jobs[index].state.isPending {
+      cancelPendingJob(at: index)
     }
   }
 
@@ -255,7 +274,7 @@ final class DownloadManager: ObservableObject {
     )
     process.standardOutput = pipe
     process.standardError = pipe
-    process.environment = processEnvironment()
+    process.environment = BackendLocator.processEnvironment()
 
     var continuation: AsyncStream<TransferEvent>.Continuation?
     let events = AsyncStream<TransferEvent> {
@@ -397,15 +416,71 @@ final class DownloadManager: ObservableObject {
     case .terminated(let status):
       transfer.terminationStatus = status
       completeIfFinished(id)
+      if !transfer.didReachEOF {
+        scheduleForcedCompletion(for: id)
+      }
     }
   }
 
-  private func completeIfFinished(_ id: UUID) {
+  private func completeIfFinished(
+    _ id: UUID,
+    gracePeriodExpired: Bool = false
+  ) {
     guard let transfer = transfers[id],
-      transfer.didReachEOF,
-      let exitCode = transfer.terminationStatus
+      let exitCode = TransferCompletionPolicy.exitCode(
+        didReachEOF: transfer.didReachEOF,
+        terminationStatus: transfer.terminationStatus,
+        gracePeriodExpired: gracePeriodExpired
+      )
     else { return }
     finish(id, exitCode: exitCode)
+  }
+
+  private func scheduleForcedCompletion(for id: UUID) {
+    guard let transfer = transfers[id],
+      transfer.completionGraceTask == nil
+    else { return }
+
+    transfer.completionGraceTask = Task { @MainActor [weak self] in
+      do {
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+      } catch {
+        return
+      }
+      self?.completeIfFinished(id, gracePeriodExpired: true)
+    }
+  }
+
+  private func scheduleCancellationEscalation(for id: UUID) {
+    guard let transfer = transfers[id],
+      transfer.cancellationEscalationTask == nil
+    else { return }
+    let identity = ObjectIdentifier(transfer)
+
+    transfer.cancellationEscalationTask = Task { @MainActor [weak self] in
+      do {
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+      } catch {
+        return
+      }
+      guard let self,
+        let active = self.transfers[id],
+        ObjectIdentifier(active) == identity,
+        active.process.isRunning
+      else { return }
+      active.process.terminate()
+
+      do {
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+      } catch {
+        return
+      }
+      guard let current = self.transfers[id],
+        ObjectIdentifier(current) == identity,
+        current.process.isRunning
+      else { return }
+      _ = Darwin.kill(current.process.processIdentifier, SIGKILL)
+    }
   }
 
   private func finish(_ id: UUID, exitCode: Int32) {
@@ -419,6 +494,8 @@ final class DownloadManager: ObservableObject {
     }
     transfer.pipe.fileHandleForReading.readabilityHandler = nil
     transfer.eventContinuation.finish()
+    transfer.completionGraceTask?.cancel()
+    transfer.cancellationEscalationTask?.cancel()
     transfers.removeValue(forKey: id)
 
     if transfer.cancelRequested {
@@ -443,21 +520,21 @@ final class DownloadManager: ObservableObject {
     startEligibleJobs()
   }
 
+  private func cancelPendingJob(at index: Int) {
+    jobs[index].state = .cancelled
+    jobs[index].statusText = "Cancelled"
+    jobs[index].speedText = nil
+    jobs[index].etaText = nil
+    jobs[index].completedAt = Date()
+    save()
+    startEligibleJobs()
+  }
+
   private func appendLog(_ text: String, to index: Int) {
     jobs[index].log += text
     if jobs[index].log.count > 30_000 {
       jobs[index].log.removeFirst(jobs[index].log.count - 30_000)
     }
-  }
-
-  private func processEnvironment() -> [String: String] {
-    var environment = ProcessInfo.processInfo.environment
-    environment["PATH"] = [
-      "/opt/homebrew/bin",
-      "/usr/local/bin",
-      environment["PATH"] ?? "/usr/bin:/bin",
-    ].joined(separator: ":")
-    return environment
   }
 
   private var storageURL: URL {
