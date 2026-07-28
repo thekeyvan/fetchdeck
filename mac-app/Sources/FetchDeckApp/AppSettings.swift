@@ -163,7 +163,7 @@ final class AppSettings: ObservableObject {
     defaults.set(value, forKey: key)
   }
 
-  private static var defaultOutputPath: String {
+  static var defaultOutputPath: String {
     if let configured = Bundle.main.object(
       forInfoDictionaryKey: "YTDefaultDownloadsPath"
     ) as? String,
@@ -172,10 +172,13 @@ final class AppSettings: ObservableObject {
     {
       return configured
     }
-    let movies =
-      FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
-      ?? FileManager.default.homeDirectoryForCurrentUser
-    return movies.appendingPathComponent("FetchDeck Downloads").path
+    let downloads =
+      FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+      ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(
+        "Downloads",
+        isDirectory: true
+      )
+    return downloads.appendingPathComponent("FetchDeck Downloads").path
   }
 
   private static var recommendedAccessSource: YouTubeAccessSource {

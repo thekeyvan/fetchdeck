@@ -1,24 +1,61 @@
 import SwiftUI
 
+private enum SettingsCategory: String, CaseIterable, Identifiable {
+  case downloads
+  case queue
+  case media
+  case access
+  case advanced
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .downloads: "Downloads"
+    case .queue: "Queue"
+    case .media: "Media"
+    case .access: "Access"
+    case .advanced: "Advanced"
+    }
+  }
+
+  var symbol: String {
+    switch self {
+    case .downloads: "arrow.down.circle.fill"
+    case .queue: "list.number"
+    case .media: "wand.and.stars"
+    case .access: "person.badge.key.fill"
+    case .advanced: "gearshape.2.fill"
+    }
+  }
+
+  var detail: String {
+    switch self {
+    case .downloads:
+      "Choose what new downloads contain and where FetchDeck saves them."
+    case .queue:
+      "Control simultaneous work, speed limits, fragments, and retries."
+    case .media:
+      "Choose the metadata, artwork, captions, and supported segments added to files."
+    case .access:
+      "Use a local browser session for media that requires an account."
+    case .advanced:
+      "Check the packaged components that power site support and media processing."
+    }
+  }
+}
+
 struct AppSettingsView: View {
   @EnvironmentObject private var settings: AppSettings
   @EnvironmentObject private var downloads: DownloadManager
+  @State private var category: SettingsCategory = .downloads
 
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 22) {
-        VStack(alignment: .leading, spacing: 5) {
-          Text("Settings")
-            .font(.largeTitle.bold())
-          Text("Defaults for every new download recipe.")
-            .foregroundStyle(.secondary)
-        }
-
-        settingsCard
-        transferCard
-        accountCard
-        finishingCard
-        systemCard
+        pageHeader
+        categoryPicker
+        selectedCard
       }
       .padding(30)
       .frame(maxWidth: 820)
@@ -26,11 +63,60 @@ struct AppSettingsView: View {
     }
   }
 
+  private var pageHeader: some View {
+    HStack(alignment: .top) {
+      VStack(alignment: .leading, spacing: 5) {
+        Text("Settings")
+          .font(.largeTitle.bold())
+        Text("Defaults for new downloads, grouped by what they control.")
+          .foregroundStyle(.secondary)
+      }
+      Spacer()
+      Button("Reset Download Defaults") {
+        settings.reset()
+      }
+      .help("Reset download, queue, and media defaults")
+    }
+  }
+
+  private var categoryPicker: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Picker("Settings category", selection: $category) {
+        ForEach(SettingsCategory.allCases) { item in
+          Label(item.title, systemImage: item.symbol)
+            .tag(item)
+        }
+      }
+      .pickerStyle(.segmented)
+
+      Text(category.detail)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .contentTransition(.opacity)
+    }
+  }
+
+  @ViewBuilder
+  private var selectedCard: some View {
+    switch category {
+    case .downloads:
+      downloadCard
+    case .queue:
+      transferCard
+    case .media:
+      finishingCard
+    case .access:
+      accountCard
+    case .advanced:
+      systemCard
+    }
+  }
+
   private var transferCard: some View {
     SurfaceCard {
       VStack(alignment: .leading, spacing: 18) {
         HStack {
-          Label("Transfer engine", systemImage: "point.3.connected.trianglepath.dotted")
+          Label("Queue & performance", systemImage: "speedometer")
             .font(.headline)
           Spacer()
           StatusPill(
@@ -95,7 +181,7 @@ struct AppSettingsView: View {
     SurfaceCard {
       VStack(alignment: .leading, spacing: 16) {
         HStack {
-          Label("Signed-in browser access", systemImage: "person.badge.key.fill")
+          Label("Site access", systemImage: "person.badge.key.fill")
             .font(.headline)
           Spacer()
           StatusPill(
@@ -106,7 +192,7 @@ struct AppSettingsView: View {
         }
 
         Text(
-          "Member, private, premium, and age-restricted media needs the same signed-in session that can play it in your browser. The app reads that session locally through yt-dlp; it never stores your password or uploads cookies."
+          "Member, private, premium, and age-restricted media needs the same signed-in session that can play it in your browser. FetchDeck reads that session locally; it never stores your password or uploads cookies."
         )
         .font(.callout)
         .foregroundStyle(.secondary)
@@ -173,7 +259,7 @@ struct AppSettingsView: View {
     }
   }
 
-  private var settingsCard: some View {
+  private var downloadCard: some View {
     SurfaceCard {
       VStack(alignment: .leading, spacing: 18) {
         Label("Download defaults", systemImage: "arrow.down.square.fill")
@@ -185,19 +271,22 @@ struct AppSettingsView: View {
           .labelsHidden()
           .frame(width: 220)
         }
-        LabeledContent("Video quality") {
-          Picker("Quality", selection: $settings.quality) {
-            ForEach(DownloadQuality.allCases) { Text($0.title).tag($0) }
+        if settings.mode == .video {
+          LabeledContent("Video quality") {
+            Picker("Quality", selection: $settings.quality) {
+              ForEach(DownloadQuality.allCases) { Text($0.title).tag($0) }
+            }
+            .labelsHidden()
+            .frame(width: 220)
           }
-          .labelsHidden()
-          .frame(width: 220)
-        }
-        LabeledContent("Audio format") {
-          Picker("Audio", selection: $settings.audioFormat) {
-            ForEach(AudioFormat.allCases) { Text($0.title).tag($0) }
+        } else {
+          LabeledContent("Audio format") {
+            Picker("Audio", selection: $settings.audioFormat) {
+              ForEach(AudioFormat.allCases) { Text($0.title).tag($0) }
+            }
+            .labelsHidden()
+            .frame(width: 220)
           }
-          .labelsHidden()
-          .frame(width: 220)
         }
         LabeledContent("Destination") {
           HStack {
@@ -214,7 +303,7 @@ struct AppSettingsView: View {
   private var finishingCard: some View {
     SurfaceCard {
       VStack(alignment: .leading, spacing: 16) {
-        Label("Finishing touches", systemImage: "wand.and.stars")
+        Label("Media details", systemImage: "wand.and.stars")
           .font(.headline)
         settingToggle(
           "Embed metadata",
@@ -238,15 +327,11 @@ struct AppSettingsView: View {
         )
         Divider()
         settingToggle(
-          "Remove sponsor segments",
-          "Use SponsorBlock data to remove sponsors, intros, outros, and self-promotion.",
+          "Skip supported sponsor segments",
+          "Remove sponsors, intros, outros, and self-promotion when segment data is available.",
           "forward.fill",
           $settings.removeSponsors
         )
-        HStack {
-          Spacer()
-          Button("Reset Defaults") { settings.reset() }
-        }
       }
     }
   }
@@ -254,7 +339,7 @@ struct AppSettingsView: View {
   private var systemCard: some View {
     SurfaceCard {
       VStack(alignment: .leading, spacing: 15) {
-        Label("Engine health", systemImage: "stethoscope")
+        Label("Components & compatibility", systemImage: "stethoscope")
           .font(.headline)
         healthRow(
           "yt-dlp",

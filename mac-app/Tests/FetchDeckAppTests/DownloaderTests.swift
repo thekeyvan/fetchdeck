@@ -248,4 +248,19 @@ final class DownloaderTests: XCTestCase {
     XCTAssertEqual(job.state, .queued)
     XCTAssertEqual(job.formatSummary, "4k video · MKV")
   }
+
+  @MainActor
+  func testDefaultOutputPathUsesDownloadsDirectory() {
+    let downloads =
+      FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+      ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(
+        "Downloads",
+        isDirectory: true
+      )
+
+    XCTAssertEqual(
+      AppSettings.defaultOutputPath,
+      downloads.appendingPathComponent("FetchDeck Downloads").path
+    )
+  }
 }

@@ -45,7 +45,7 @@ advertising.
 Official release artifacts are signed with a Developer ID certificate,
 notarized by Apple, and compatible with macOS 13 or newer.
 
-The default destination is `~/Movies/FetchDeck Downloads`. You can change it in
+The default destination is `~/Downloads/FetchDeck Downloads`. You can change it in
 Settings.
 
 ## Signed-in media
